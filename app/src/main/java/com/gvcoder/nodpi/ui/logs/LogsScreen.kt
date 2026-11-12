@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.ReceiptLong
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Http
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
@@ -47,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,6 +78,7 @@ private enum class LogFilter(val label: Int, val kinds: Set<LogKind>) {
 @Composable
 fun LogsScreen(snackbar: SnackbarHostState) {
     val context = LocalContext.current
+    val resources = LocalResources.current
     val scope = rememberCoroutineScope()
     val entries by ProxyController.log.entries.collectAsStateWithLifecycle()
     val domains by AppGraph.blacklist.domains.collectAsStateWithLifecycle()
@@ -91,8 +94,12 @@ fun LogsScreen(snackbar: SnackbarHostState) {
                 title = { Text(stringResource(R.string.nav_logs)) },
                 actions = {
                     IconButton(enabled = entries.isNotEmpty(), onClick = {
-                        val text = entries.joinToString("\n") { it.toLine(timeFormat) }
-                        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+                        val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.ROOT).format(Date())
+                        val title = "nodpi-log-$stamp"
+                        val text = "$title\n" + entries.joinToString("\n") { it.toLine(timeFormat) }
+                        val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+                            .putExtra(Intent.EXTRA_SUBJECT, title)
+                            .putExtra(Intent.EXTRA_TEXT, text)
                         context.startActivity(Intent.createChooser(send, null))
                     }) {
                         Icon(Icons.Rounded.Share, contentDescription = stringResource(R.string.action_share))
@@ -130,7 +137,7 @@ fun LogsScreen(snackbar: SnackbarHostState) {
                     modifier = Modifier.weight(1f),
                 ) {
                     itemsIndexed(shown, key = { _, entry -> entry.id }) { index, entry ->
-                        val canAdd = entry.kind == LogKind.DIRECT || entry.kind == LogKind.ERROR
+                        val canAdd = entry.method == "CONNECT" && (entry.kind == LogKind.DIRECT || entry.kind == LogKind.ERROR)
                         LogItem(
                             entry = entry,
                             time = timeFormat.format(Date(entry.time)),
@@ -139,7 +146,7 @@ fun LogsScreen(snackbar: SnackbarHostState) {
                             onAddToBlacklist = if (canAdd && entry.host != "?" && !blacklist.isBlocked(entry.host)) {
                                 {
                                     AppGraph.blacklist.add(entry.host)
-                                    scope.launch { snackbar.showSnackbar(context.getString(R.string.logs_added_to_blacklist, entry.host)) }
+                                    scope.launch { snackbar.showSnackbar(resources.getString(R.string.logs_added_to_blacklist, entry.host)) }
                                 }
                             } else {
                                 null
@@ -167,6 +174,7 @@ private fun LogItem(
         LogKind.UNBLOCKED -> Triple(Icons.Rounded.LockOpen, colors.tertiaryContainer, colors.onTertiaryContainer)
         LogKind.DIRECT -> Triple(Icons.Rounded.Lock, colors.secondaryContainer, colors.onSecondaryContainer)
         LogKind.PLAIN -> Triple(Icons.Rounded.Http, colors.secondaryContainer, colors.onSecondaryContainer)
+        LogKind.INFO -> Triple(Icons.Rounded.Info, colors.secondaryContainer, colors.onSecondaryContainer)
         LogKind.ERROR -> Triple(Icons.Rounded.ErrorOutline, colors.errorContainer, colors.onErrorContainer)
     }
 
@@ -177,7 +185,7 @@ private fun LogItem(
             supportingContent = {
                 val traffic = "↓ ${formatSize(entry.bytesIn)}   ↑ ${formatSize(entry.bytesOut)}"
                 Text(
-                    entry.message ?: if (entry.cloudflare) "$traffic\n${stringResource(R.string.logs_cloudflare)}" else traffic,
+                    if (entry.kind == LogKind.ERROR || entry.kind == LogKind.INFO) entry.message.orEmpty() else if (entry.cloudflare) "$traffic\n${stringResource(R.string.logs_cloudflare)}" else traffic,
                     maxLines = 3,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -231,9 +239,9 @@ private fun EmptyLogs(modifier: Modifier = Modifier) {
 
 private fun LogEntry.toLine(format: SimpleDateFormat): String {
     val time = format.format(Date(time))
-    return if (kind == LogKind.ERROR) {
-        "$time ERROR $method $host : $message"
+    return if (kind == LogKind.ERROR || kind == LogKind.INFO) {
+        "$time ${kind.name} $method $host : $message"
     } else {
-        "$time ${kind.name} $method $host $bytesIn $bytesOut"
+        "$time ${if (kind == LogKind.UNBLOCKED) "FRAGMENTED" else kind.name} $method $host $bytesIn $bytesOut" + (if (cloudflare) " cloudflare=true" else "") + (message?.let { " $it" } ?: "")
     }
 }

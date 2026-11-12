@@ -14,7 +14,10 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.Semaphore
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -31,11 +34,16 @@ class ProxyServer(
     private val blacklist: Blacklist,
     private val stats: ProxyStats,
     private val log: ProxyLog,
+    private val networkDiagnostics: () -> String = { "network=UNKNOWN" },
 ) {
 
-    private val executor: ExecutorService = Executors.newCachedThreadPool { task ->
-        Thread(task, "nodpi-proxy").apply { isDaemon = true }
-    }
+    private val executor: ExecutorService = ThreadPoolExecutor(
+        0, MAX_CONNECTIONS * 2 + 1, 30, TimeUnit.SECONDS, SynchronousQueue(),
+        { task -> Thread(task, "nodpi-proxy").apply { isDaemon = true } },
+    )
+    private val slots = Semaphore(MAX_CONNECTIONS)
+    private val clients = ConcurrentHashMap.newKeySet<Socket>()
+    private val resolver = DomainResolver(config.dohEnabled, config.vpnEnabled && config.ipv4Only)
     private val sockets = ConcurrentHashMap.newKeySet<Socket>()
 
     @Volatile
@@ -60,11 +68,17 @@ class ProxyServer(
         executor.execute { acceptLoop(server) }
     }
 
+    /** Keep the listener/configuration, drop only flows bound to the previous network. */
+    fun resetConnections() {
+        sockets.asSequence().toList().forEach { runCatching { it.close() } }
+    }
+
     fun stop() {
         running = false
         runCatching { serverSocket?.close() }
         sockets.forEach { runCatching { it.close() } }
         sockets.clear()
+        clients.asSequence().toList().forEach(::close)
         executor.shutdownNow()
     }
 
@@ -75,6 +89,12 @@ class ProxyServer(
             } catch (_: IOException) {
                 continue
             }
+            if (!slots.tryAcquire()) {
+                runCatching { client.close() }
+                log.error("PROXY", "LIMIT", "Concurrent connection limit reached ($MAX_CONNECTIONS)")
+                continue
+            }
+            clients += client
             sockets += client
             try {
                 executor.execute { handleConnection(client) }
@@ -110,25 +130,27 @@ class ProxyServer(
 
             if (request.isConnect) {
                 blacklist.check(request.host)
-                remote = connectRemote(request.host, request.port)
+                remote = connectRemote(request.host, request.port, info)
 
                 client.getOutputStream().write(CONNECTION_ESTABLISHED)
-                stats.addIncoming(CONNECTION_ESTABLISHED.size)
-                info.trafficIn.addAndGet(CONNECTION_ESTABLISHED.size.toLong())
+                // This response is generated locally, not received from the destination.
 
                 // Bytes the client sent right after CONNECT belong to the tunnel
                 val leftover = head.bytes.copyOfRange(head.headerEnd, head.bytes.size)
                 val tunnelIn = if (leftover.isEmpty()) clientIn else SequenceInputStream(ByteArrayInputStream(leftover), clientIn)
 
-                client.soTimeout = 0
-                if (!sendInitialTlsData(tunnelIn, remote, info)) {
+                info.phase = "TLS_INITIAL"
+                client.soTimeout = REQUEST_TIMEOUT_MS
+                if (request.port == 443 && !sendInitialTlsData(tunnelIn, remote, info)) {
                     close(remote)
                     close(client)
                     return
                 }
+                client.soTimeout = 0
+                info.phase = "STREAM"
                 pipeBothWays(client, tunnelIn, remote, info)
             } else {
-                remote = connectRemote(request.host, request.port)
+                remote = connectRemote(request.host, request.port, info)
                 remote.getOutputStream().write(head.bytes)
                 stats.countDirect()
                 info.kind = LogKind.PLAIN
@@ -165,7 +187,11 @@ class ProxyServer(
         val body = ByteArray(length)
         readFully(input, body, 0, length)
 
-        val blocked = blacklist.isBlocked(info.host)
+        val originalHost = info.host
+        val serverName = TlsServerName.read(body)
+        if (serverName != null) info.host = serverName
+        val numericTarget = originalHost.contains(':') || originalHost.matches(Regex("[0-9.]+"))
+        val blocked = blacklist.isBlocked(if (numericTarget && serverName != null) serverName else originalHost)
         val cloudflare = blocked && CloudflareRanges.contains(remote.inetAddress)
         if (!blocked || cloudflare) {
             stats.countDirect()
@@ -196,18 +222,19 @@ class ProxyServer(
 
     private fun pipeBothWays(client: Socket, clientIn: InputStream, remote: Socket, info: ConnectionInfo) {
         try {
-            executor.execute { pipe(remote.getInputStream(), remote, client, incoming = true, info) }
+            executor.execute { pipe({ remote.getInputStream() }, remote, client, incoming = true, info) }
         } catch (e: RejectedExecutionException) {
             close(remote)
             close(client)
             return
         }
-        pipe(clientIn, client, remote, incoming = false, info)
+        pipe({ clientIn }, client, remote, incoming = false, info)
     }
 
-    private fun pipe(input: InputStream, source: Socket, target: Socket, incoming: Boolean, info: ConnectionInfo) {
+    private fun pipe(openInput: () -> InputStream, source: Socket, target: Socket, incoming: Boolean, info: ConnectionInfo) {
         val buffer = ByteArray(BUFFER_SIZE)
         try {
+            val input = openInput()
             val out = target.getOutputStream()
             while (true) {
                 val read = input.read(buffer)
@@ -228,7 +255,8 @@ class ProxyServer(
             close(target)
             if (info.pipes.decrementAndGet() == 0) {
                 close(source)
-                log.access(info.kind, info.host, info.method, info.trafficIn.get(), info.trafficOut.get(), info.cloudflare)
+                log.access(info.kind, info.host, info.method, info.trafficIn.get(), info.trafficOut.get(), info.cloudflare,
+                    if (info.trafficIn.get() > 0) "REMOTE_DATA_RECEIVED" else "NO_REMOTE_DATA")
             }
         }
     }
@@ -241,18 +269,32 @@ class ProxyServer(
             } catch (_: IOException) {
             }
             stats.countError()
-            log.error(info?.host ?: "?", info?.method ?: "?", describe(error))
+            val context = runCatching { networkDiagnostics() }.getOrDefault("network=UNKNOWN")
+            val destination = info?.let {
+                "ip=${it.remoteIp}; port=${it.remotePort}; family=${it.family}; dnsSource=${it.dnsSource}; dnsMs=${it.dnsMs}; connectMs=${it.connectMs}; phaseElapsedMs=${(System.nanoTime() - it.phaseStarted) / 1_000_000}"
+            } ?: "destination=UNKNOWN"
+            log.error(info?.host ?: "?", info?.method ?: "?", "${info?.phase ?: "REQUEST"}: $destination; $context; ${NetworkFailure.describe(error)}")
         }
         remote?.let(::close)
         close(client)
     }
 
-    private fun connectRemote(host: String, port: Int): Socket {
+    private fun connectRemote(host: String, port: Int, info: ConnectionInfo): Socket {
         val socket = Socket(Proxy.NO_PROXY)
         sockets += socket
         try {
             socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            info.remotePort = port
+            info.dnsSource = if (host.contains(':') || host.matches(Regex("[0-9.]+"))) "CLIENT_IP" else if (config.dohEnabled) "DOH" else "SYSTEM"
+            info.phase = "DNS"
+            val dnsStart = System.nanoTime()
+            val address = try { resolver.resolve(host) } finally { info.dnsMs = (System.nanoTime() - dnsStart) / 1_000_000 }
+            info.remoteIp = address.hostAddress.orEmpty()
+            info.family = if (address.address.size == 4) "IPv4" else "IPv6"
+            info.phase = "TCP_CONNECT"
+            val connectStart = System.nanoTime()
+            try { socket.connect(InetSocketAddress(address, port), CONNECT_TIMEOUT_MS) }
+            finally { info.connectMs = (System.nanoTime() - connectStart) / 1_000_000 }
         } catch (e: IOException) {
             close(socket)
             throw e
@@ -282,13 +324,23 @@ class ProxyServer(
     }
 
     private fun close(socket: Socket) {
+        if (clients.remove(socket)) slots.release()
         sockets -= socket
         runCatching { socket.close() }
     }
 
-    private class ConnectionInfo(val host: String, val method: String) {
+    private class ConnectionInfo(@Volatile var host: String, val method: String) {
         @Volatile
         var kind: LogKind = LogKind.PLAIN
+        @Volatile var phaseStarted = System.nanoTime()
+        var phase: String = "REQUEST"
+            set(value) { field = value; phaseStarted = System.nanoTime() }
+        var remoteIp = "UNKNOWN"
+        var remotePort = 0
+        var family = "UNKNOWN"
+        var dnsSource = "UNKNOWN"
+        var dnsMs = -1L
+        var connectMs = -1L
 
         /** Blocked domain on Cloudflare: its ClientHello was deliberately left unfragmented */
         @Volatile
@@ -301,6 +353,7 @@ class ProxyServer(
     private class RequestHead(val bytes: ByteArray, val headerEnd: Int)
 
     companion object {
+        private const val MAX_CONNECTIONS = ConnectionLimits.TRAFFIC_SESSIONS
         private const val BACKLOG = 128
         private const val BUFFER_SIZE = 16 * 1024
         private const val MAX_HEAD_SIZE = 64 * 1024
@@ -354,8 +407,6 @@ class ProxyServer(
             return -1
         }
 
-        private fun describe(error: Throwable): String =
-            listOfNotNull(error.javaClass.simpleName, error.message).joinToString(": ")
     }
 }
 

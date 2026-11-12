@@ -1,0 +1,234 @@
+--- a/src/hev-jni.h
++++ b/src/hev-jni.h
+@@ -10,4 +10,10 @@
+ #ifndef __HEV_JNI_H__
+ #define __HEV_JNI_H__
+ 
++#ifdef ANDROID
++int nodpi_select_port (int protocol, const char *source, int source_port, const char *destination, int destination_port);
++#else
++static inline int nodpi_select_port (int protocol, const char *source, int source_port, const char *destination, int destination_port) { return 0; }
++#endif
++
+ #endif /* __HEV_JNI_H__ */
+--- a/src/hev-jni.c
++++ b/src/hev-jni.c
+@@ -46,6 +46,8 @@
+ static atomic_int is_running;
+ static int thread_joinable;
+ static JavaVM *java_vm;
++static jclass routing_class;
++static jmethodID routing_method;
+ static pthread_t work_thread;
+ static pthread_mutex_t mutex;
+ static pthread_key_t current_jni_env;
+@@ -91,6 +93,14 @@
+     if (res < 0)
+         return JNI_ERR;
+ 
++    klass = (*env)->FindClass(env, "com/gvcoder/nodpi/core/NativeRouting");
++    if (!klass) return JNI_ERR;
++    routing_class = (*env)->NewGlobalRef(env, klass);
++    (*env)->DeleteLocalRef(env, klass);
++    if (!routing_class) return JNI_ERR;
++    routing_method = (*env)->GetStaticMethodID(env, routing_class, "selectPort", "(ILjava/lang/String;ILjava/lang/String;I)I");
++    if (!routing_method) return JNI_ERR;
++
+     pthread_key_create (&current_jni_env, detach_current_thread);
+     pthread_mutex_init (&mutex, NULL);
+ 
+@@ -210,4 +220,107 @@
+     return res;
+ }
+ 
++/* Called on the native event-loop thread before a flow opens its SOCKS connection. */
++static int
++call_java_route (int protocol, const char *source, int source_port,
++                   const char *destination, int destination_port)
++{
++    JNIEnv *env = NULL;
++    jstring src, dst;
++    jint result;
++    if (!java_vm) return 0; /* Standalone Android executable has no JVM. */
++    if ((*java_vm)->GetEnv(java_vm, (void **)&env, JNI_VERSION_1_4) != JNI_OK) {
++        if ((*java_vm)->AttachCurrentThreadAsDaemon(java_vm, &env, NULL) != JNI_OK) return -1;
++        pthread_setspecific(current_jni_env, env);
++    }
++    src = (*env)->NewStringUTF(env, source);
++    dst = (*env)->NewStringUTF(env, destination);
++    if (!src || !dst) {
++        if (src) (*env)->DeleteLocalRef(env, src);
++        if (dst) (*env)->DeleteLocalRef(env, dst);
++        (*env)->ExceptionClear(env);
++        return -1;
++    }
++    result = (*env)->CallStaticIntMethod(env, routing_class, routing_method,
++                                       protocol, src, source_port, dst, destination_port);
++    (*env)->DeleteLocalRef(env, src);
++    (*env)->DeleteLocalRef(env, dst);
++    if ((*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++        return -1;
++    }
++    return result >= 0 && result <= 65535 ? result : -1;
++}
++
++/* JNI must execute on an ordinary pthread stack, never Hev's coroutine stack. */
++static pthread_mutex_t route_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t route_request = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t route_done = PTHREAD_COND_INITIALIZER;
++static pthread_once_t route_once = PTHREAD_ONCE_INIT;
++static int route_ready, route_busy, route_pending, route_complete, route_result;
++static int route_protocol, route_source_port, route_destination_port;
++static char route_source[64], route_destination[64];
++
++static void *
++route_worker (void *unused)
++{
++    for (;;) {
++        int protocol, source_port, destination_port, result;
++        char source[64], destination[64];
++        pthread_mutex_lock(&route_mutex);
++        while (!route_pending) pthread_cond_wait(&route_request, &route_mutex);
++        protocol = route_protocol;
++        source_port = route_source_port;
++        destination_port = route_destination_port;
++        memcpy(source, route_source, sizeof(source));
++        memcpy(destination, route_destination, sizeof(destination));
++        route_pending = 0;
++        pthread_mutex_unlock(&route_mutex);
++        result = call_java_route(protocol, source, source_port, destination, destination_port);
++        pthread_mutex_lock(&route_mutex);
++        route_result = result;
++        route_complete = 1;
++        pthread_cond_broadcast(&route_done);
++        pthread_mutex_unlock(&route_mutex);
++    }
++    return NULL;
++}
++
++static void
++start_route_worker (void)
++{
++    pthread_t thread;
++    if (pthread_create(&thread, NULL, route_worker, NULL) == 0) {
++        pthread_detach(thread);
++        route_ready = 1;
++    }
++}
++
++int
++nodpi_select_port (int protocol, const char *source, int source_port,
++                   const char *destination, int destination_port)
++{
++    int result;
++    if (!java_vm) return 0;
++    pthread_once(&route_once, start_route_worker);
++    if (!route_ready) return -1;
++    pthread_mutex_lock(&route_mutex);
++    while (route_busy) pthread_cond_wait(&route_done, &route_mutex);
++    route_busy = 1;
++    route_protocol = protocol;
++    route_source_port = source_port;
++    route_destination_port = destination_port;
++    snprintf(route_source, sizeof(route_source), "%s", source);
++    snprintf(route_destination, sizeof(route_destination), "%s", destination);
++    route_complete = 0;
++    route_pending = 1;
++    pthread_cond_signal(&route_request);
++    while (!route_complete) pthread_cond_wait(&route_done, &route_mutex);
++    result = route_result;
++    route_busy = 0;
++    pthread_cond_broadcast(&route_done);
++    pthread_mutex_unlock(&route_mutex);
++    return result;
++}
++
+ #endif /* ANDROID */
+--- a/src/hev-socks5-session.h
++++ b/src/hev-socks5-session.h
+@@ -27,6 +27,7 @@
+     HevListNode node;
+     HevTask *task;
+     HevSocks5Session *self;
++    int nodpi_upstream_port;
+ };
+ 
+ struct _HevSocks5SessionIface
+--- a/src/hev-socks5-session.c
++++ b/src/hev-socks5-session.c
+@@ -24,13 +24,17 @@
+     HevSocks5SessionIface *iface;
+     HevConfigServer *srv;
+     int res;
++    HevSocks5SessionData *data;
+ 
+     LOG_D ("%p socks5 session run", self);
+ 
+     srv = hev_config_get_socks5_server ();
+ 
++    /* node is the first member of the common per-flow data. */
++    data = (HevSocks5SessionData *)hev_socks5_session_get_node(self);
++    if (data->nodpi_upstream_port < 0) return;
+     res = hev_socks5_client_connect (HEV_SOCKS5_CLIENT (self), srv->addr,
+-                                     srv->port);
++                                     data->nodpi_upstream_port > 0 ? data->nodpi_upstream_port : srv->port);
+     if (res < 0) {
+         LOG_I ("%p socks5 session connect", self);
+         return;
+--- a/src/hev-socks5-session-tcp.c
++++ b/src/hev-socks5-session-tcp.c
+@@ -1,3 +1,4 @@
++#include "hev-jni.h"
+ /*
+  ============================================================================
+  Name        : hev-socks5-session-tcp.c
+@@ -334,6 +335,14 @@
+     tcp_sent (pcb, tcp_sent_handler);
+     tcp_err (pcb, tcp_err_handler);
+ 
++    /* lwIP's transparent stack reverses endpoints: remote is the original app. */
++    {
++        char source[64], destination[64];
++        ipaddr_ntoa_r(&pcb->remote_ip, source, sizeof(source));
++        ipaddr_ntoa_r(&pcb->local_ip, destination, sizeof(destination));
++        self->data.nodpi_upstream_port = nodpi_select_port(6, source, pcb->remote_port,
++                                                         destination, pcb->local_port);
++    }
+     self->pcb = pcb;
+     self->mutex = mutex;
+     self->data.self = self;
+--- a/src/hev-socks5-session-udp.c
++++ b/src/hev-socks5-session-udp.c
+@@ -1,3 +1,4 @@
++#include "hev-jni.h"
+ /*
+  ============================================================================
+  Name        : hev-socks5-session-udp.c
+@@ -482,6 +483,14 @@
+ 
+     udp_recv (pcb, udp_recv_handler, self);
+ 
++    /* lwIP's transparent stack reverses endpoints: remote is the original app. */
++    {
++        char source[64], destination[64];
++        ipaddr_ntoa_r(&pcb->remote_ip, source, sizeof(source));
++        ipaddr_ntoa_r(&pcb->local_ip, destination, sizeof(destination));
++        self->data.nodpi_upstream_port = nodpi_select_port(17, source, pcb->remote_port,
++                                                         destination, pcb->local_port);
++    }
+     self->pcb = pcb;
+     self->mutex = mutex;
+     self->data.self = self;
+--- a/src/hev-socks5-tunnel.c
++++ b/src/hev-socks5-tunnel.c
+@@ -287,6 +287,9 @@
+         }
+     }
+ 
++    /* First transparent UDP dispatch has not populated its destination yet. */
++    ip_addr_copy(pcb->local_ip, *addr);
++    pcb->local_port = port;
+     udp = hev_socks5_session_udp_new (pcb, &mutex);
+     if (!udp) {
+         udp_remove (pcb);

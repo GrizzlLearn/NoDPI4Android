@@ -55,6 +55,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -75,6 +76,7 @@ private enum class ConfirmAction { RESET, CLEAR }
 @Composable
 fun BlacklistScreen(settings: AppSettings, snackbar: SnackbarHostState) {
     val context = LocalContext.current
+    val resources = LocalResources.current
     val scope = rememberCoroutineScope()
     val repository = AppGraph.blacklist
     val domains by repository.domains.collectAsStateWithLifecycle()
@@ -103,8 +105,8 @@ fun BlacklistScreen(settings: AppSettings, snackbar: SnackbarHostState) {
                 }.getOrNull()
             }
             message(
-                if (added == null) context.getString(R.string.blacklist_import_failed)
-                else context.resources.getQuantityString(R.plurals.blacklist_added, added, added),
+                if (added == null) resources.getString(R.string.blacklist_import_failed)
+                else resources.getQuantityString(R.plurals.blacklist_added, added, added),
             )
         }
     }
@@ -116,7 +118,7 @@ fun BlacklistScreen(settings: AppSettings, snackbar: SnackbarHostState) {
                     context.contentResolver.openOutputStream(uri, "wt")!!.use { it.write(repository.export().toByteArray()) }
                 }.isSuccess
             }
-            message(context.getString(if (ok) R.string.blacklist_exported else R.string.blacklist_export_failed))
+            message(resources.getString(if (ok) R.string.blacklist_exported else R.string.blacklist_export_failed))
         }
     }
 
@@ -185,7 +187,7 @@ fun BlacklistScreen(settings: AppSettings, snackbar: SnackbarHostState) {
         ) {
             item(key = "header") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(bottom = 12.dp)) {
-                    when (settings.blacklistMode) {
+                    when (settings.toProxyConfig().blacklistMode) {
                         BlacklistMode.ALL -> InfoBanner(Icons.Rounded.Public, stringResource(R.string.blacklist_mode_all_hint))
                         BlacklistMode.AUTO -> InfoBanner(Icons.Rounded.AutoAwesome, stringResource(R.string.blacklist_mode_auto_hint))
                         BlacklistMode.STANDARD -> Unit
@@ -239,8 +241,8 @@ fun BlacklistScreen(settings: AppSettings, snackbar: SnackbarHostState) {
                                 repository.remove(domain)
                                 scope.launch {
                                     val result = snackbar.showSnackbar(
-                                        message = context.getString(R.string.blacklist_removed, domain),
-                                        actionLabel = context.getString(R.string.action_undo),
+                                        message = resources.getString(R.string.blacklist_removed, domain),
+                                        actionLabel = resources.getString(R.string.action_undo),
                                         withDismissAction = true,
                                     )
                                     if (result == SnackbarResult.ActionPerformed) {
@@ -265,8 +267,8 @@ fun BlacklistScreen(settings: AppSettings, snackbar: SnackbarHostState) {
                 showAdd = false
                 val added = repository.add(text)
                 message(
-                    if (added == 0) context.getString(R.string.blacklist_nothing_added)
-                    else context.resources.getQuantityString(R.plurals.blacklist_added, added, added),
+                    if (added == 0) resources.getString(R.string.blacklist_nothing_added)
+                    else resources.getQuantityString(R.plurals.blacklist_added, added, added),
                 )
             },
         )

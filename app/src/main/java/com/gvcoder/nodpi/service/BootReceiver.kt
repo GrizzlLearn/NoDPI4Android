@@ -18,7 +18,8 @@ class BootReceiver : BroadcastReceiver() {
         val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                if (AppGraph.settings.current().autostart) {
+                val settings = AppGraph.settings.current()
+                if (settings.autostart && (!settings.vpnEnabled || android.net.VpnService.prepare(context) == null)) {
                     ProxyController.start(context.applicationContext)
                 }
             } catch (_: Exception) {

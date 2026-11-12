@@ -16,11 +16,13 @@ object TlsProbe {
      * Opens a direct TLS connection to [domain]:443. The domain is considered blocked
      * when TCP connects but the TLS handshake times out: that is how DPI drops a ClientHello
      */
-    fun isHandshakeTimingOut(domain: String): Boolean {
+    fun isHandshakeTimingOut(domain: String): Boolean = isHandshakeTimingOut(domain, DomainResolver(false))
+
+    fun isHandshakeTimingOut(domain: String, resolver: DomainResolver): Boolean {
         val raw = Socket(Proxy.NO_PROXY)
         try {
             try {
-                raw.connect(InetSocketAddress(domain, 443), TIMEOUT_MS)
+                raw.connect(InetSocketAddress(resolver.resolve(domain), 443), TIMEOUT_MS)
             } catch (_: Exception) {
                 return false
             }

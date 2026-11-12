@@ -1,6 +1,8 @@
 package com.gvcoder.nodpi.core
 
 import android.os.ParcelFileDescriptor
+import android.os.Build
+import androidx.annotation.RequiresApi
 import android.system.Os
 import android.system.OsConstants
 import java.io.FileDescriptor
@@ -26,6 +28,12 @@ object Disorder {
         val out = socket.getOutputStream()
         socket.tcpNoDelay = true
 
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            out.write(first)
+            out.write(rest)
+            return
+        }
+
         val dup = runCatching { ParcelFileDescriptor.fromSocket(socket) }.getOrNull()
         if (dup == null) {
             out.write(first)
@@ -50,6 +58,7 @@ object Disorder {
         out.write(rest)
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     private fun setInt(fd: FileDescriptor, level: Int, option: Int, value: Int) {
         runCatching { Os.setsockoptInt(fd, level, option, value) }
     }

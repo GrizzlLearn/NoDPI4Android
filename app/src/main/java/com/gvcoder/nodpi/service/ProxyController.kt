@@ -1,5 +1,12 @@
 package com.gvcoder.nodpi.service
 
+import android.content.Intent
+import android.net.VpnService
+import com.gvcoder.nodpi.AppGraph
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import android.content.Context
 import androidx.core.content.ContextCompat
 import com.gvcoder.nodpi.core.ProxyConfig
@@ -32,12 +39,29 @@ object ProxyController {
     val isActive: Boolean
         get() = status.value.let { it is ProxyStatus.Running || it is ProxyStatus.Starting }
 
-    fun start(context: Context) {
-        ContextCompat.startForegroundService(context, ProxyService.intent(context, ProxyService.ACTION_START))
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    fun start(context: Context) = requestStart(context, ProxyService.ACTION_START)
+
+    private fun requestStart(context: Context, action: String) {
+        val application = context.applicationContext
+        scope.launch {
+            try {
+                val settings = AppGraph.settings.current()
+                if (settings.vpnEnabled && VpnService.prepare(application) != null) {
+                    application.startActivity(Intent(application, VpnPermissionActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("action", action))
+                } else {
+                    ContextCompat.startForegroundService(application, ProxyService.intent(application, action))
+                }
+            } catch (error: Exception) {
+                setStatus(ProxyStatus.Failed(error.message ?: error.javaClass.simpleName))
+            }
+        }
     }
 
     fun restart(context: Context) {
-        ContextCompat.startForegroundService(context, ProxyService.intent(context, ProxyService.ACTION_RESTART))
+        requestStart(context, ProxyService.ACTION_RESTART)
     }
 
     fun stop(context: Context) {

@@ -43,12 +43,7 @@ class ProxyTileService : TileService() {
             ProxyController.stop(this)
             return
         }
-        try {
-            ProxyController.start(this)
-        } catch (_: Exception) {
-            // The system may refuse to start a foreground service from the tile: start it from the app
-            openApp()
-        }
+        openApp()
     }
 
     private fun render(status: ProxyStatus) {

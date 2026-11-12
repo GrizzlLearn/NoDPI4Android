@@ -23,6 +23,13 @@ enum class DomainMatching {
 
 /** Configuration of a single proxy server run */
 data class ProxyConfig(
+    val upstream: Socks5Config = Socks5Config(),
+    val upstreamPackages: Set<String> = emptySet(),
+    val vpnEnabled: Boolean = false,
+    val vpnSelectedOnly: Boolean = false,
+    val vpnPackages: Set<String> = emptySet(),
+    val dohEnabled: Boolean = false,
+    val ipv4Only: Boolean = false,
     val host: String = DEFAULT_HOST,
     val port: Int = DEFAULT_PORT,
     val blacklistMode: BlacklistMode = BlacklistMode.STANDARD,
@@ -31,6 +38,14 @@ data class ProxyConfig(
     val username: String? = null,
     val password: String? = null,
 ) {
+    fun validateRoutes() {
+        if (vpnEnabled && upstream.enabled) {
+            upstream.validate()
+            require(upstreamPackages.isNotEmpty()) { "Choose applications for external SOCKS5" }
+        }
+    }
+
+    val capturedPackages: Set<String> get() = vpnPackages + if (upstream.enabled) upstreamPackages else emptySet()
     val authEnabled: Boolean get() = username != null && password != null
 
     companion object {

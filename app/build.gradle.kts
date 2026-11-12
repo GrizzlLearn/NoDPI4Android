@@ -38,6 +38,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".test"
+            versionNameSuffix = "-test"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -59,7 +63,7 @@ android {
     }
 
     lint {
-        abortOnError = false
+        abortOnError = true
     }
 }
 
@@ -75,6 +79,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(files("libs/hev-socks5-tunnel-2.19.3-nodpi.aar"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)

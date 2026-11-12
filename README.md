@@ -177,3 +177,84 @@ A: No. Unlike a VPN or Tor, this program does not hide your traffic from your In
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=GVCoder09/NoDPI4Android&type=Date)](https://star-history.dera.page/#GVCoder09/NoDPI4Android&Date)
+
+## Local VPN (this fork)
+
+Android10+ supports local VPN; Android7–9 retains manual HTTP proxy mode. In
+Connection and bypass, choose all apps or selected apps. Their HTTPS uses local
+bypass for all domains (existing Cloudflare exclusions remain). Save and apply in
+the app picker reconnects a running VPN; other changes use Apply and reconnect.
+Remove the manual Wi-Fi proxy once. This occupies the profile's single VPN slot.
+Do not enable block-connections-without-VPN if direct access is needed after stopping.
+
+### External SOCKS5
+
+Configure a hostname/IP, port and optional username/password, then choose external-route
+apps. They are automatically included in VPN capture. Other captured apps retain local
+bypass. Shared-UID groups must be selected in full; otherwise external routing refuses startup.
+Passwords use Android Keystore encryption, never logs; restore on a new device requires
+re-entering them. SOCKS5 itself does not encrypt transport to the proxy.
+
+Routing uses original flow ownership, not destination heuristics. The patched
+HevSocks5Tunnel2.19.3 and reproducible build are documented in `native/README.md`.
+Unknown owners fail closed when external routing is enabled. External failures never
+fall back directly. External SOCKS5 currently supports TCP; external UDP is blocked.
+An actually reachable external server is required; IP-blocked proxies cannot work.
+
+### DNS, diagnostics and resource limits
+
+VPN DNS returns real addresses via Cloudflare wire DoH or underlying non-VPN network DNS.
+It no longer emits temporary198.19/16 addresses. DNS for external apps uses the same
+chosen resolver, not remote SOCKS DNS. Old synthetic addresses and internal DNS:853
+fail immediately; restart affected apps once after upgrading to refresh caches.
+The manual-proxy DoH address resolver retains its IPv4-only behavior.
+
+Home displays configured/applied app routes, without claiming reachability. Explicit
+diagnostics check proxy DNS, proxy TCP, CONNECT, certificate-verified TLS and an HTTP
+response. Local diagnostics require NoDPI running. SOCKS server testing connects to
+telegram.org:443. FRAGMENTED logs mean processing applied; remote-data receipt is a
+separate status and excludes generated CONNECT response bytes.
+
+Traffic bridges share128 session slots, at most16 occupied by UDP. DNS has16 separate slots. QUIC associations close immediately; UDP associations with no outbound packets close after30seconds. HTTP proxy has128 client slots. Worker pools are
+bounded. Local UDP has no DPI bypass; UDP/443 is dropped for TCP fallback. Apps without
+fallback may fail. The private no-backup journal retains500 entries. Android11+ previous
+process-exit information and a separate Java crash record aid diagnostics. Device tests
+are required to validate real Android UID ownership and sustained background behavior.
+
+### Network changes, settings transfer and CI
+
+Physical-network changes retain the VPN interface and applied app routes, then reset
+old sessions for application retry. Changes debounce750ms with up to3 update attempts.
+Offline state keeps VPN capture; pending settings are not loaded on handover and late
+callbacks cannot restart a stopped service.
+
+Settings transfer uses the Android document picker and a versioned `.properties` file.
+It includes app routes, SOCKS endpoint, bypass options and domains, excluding all usernames,
+passwords, manual-proxy binding/authentication, autostart and consent. Import is validated,
+confirmed, replaces domains, and does not reconnect a running VPN. Authenticated SOCKS
+requires credentials again before startup; invalid routes do not replace a running VPN.
+Limits are1MiB,500packages per list and10000domains.
+
+The push/PR validation workflow rebuilds the pinned native source, runs the native harness,
+unit tests, debug build and lint with errors enforced. APK/reports are retained7days;
+there is no deployment or publishing step.
+
+TCP bridge flows expire after60seconds with no traffic in either direction; capacity pressure first reclaims a TCP flow idle for at least5seconds. DNS UDP associations expire shortly after becoming idle following a reply. LIMIT diagnostics include pool identity, session counts, phases and idle age.
+
+### IPv4-only VPN mode
+
+The optional IPv4 only switch suppresses AAAA and HTTPS/SVCB DNS answers with
+NOERROR/NODATA and immediately rejects cached IPv6 destinations. IPv6 routes remain
+captured to prevent bypass. Apply/reconnect and restart affected apps to clear caches.
+IPv6-only services cannot work; apps using their own encrypted DNS can still obtain
+IPv6 answers, but captured IPv6 destinations remain blocked. The setting defaults off,
+is included in settings transfer, and old exports without it import as ordinary dual-stack
+mode. Manual HTTP proxy mode is unaffected.
+
+DNS pool pressure can reclaim a completed UDP association before periodic cleanup, after a short reply-drain grace interval. State is rechecked while synchronized with query-start; in-flight DNS queries are never selected. The DNS limit remains16.
+
+Connection failures include selected IP/port/family, DNS source, measured DNS/TCP and phase
+timing, nested causes and known errno. The physical-network snapshot is taken on failure
+and includes transport, Android validation and default IPv4/IPv6 routes; it is not a probe
+of that destination. TIMEOUT_UNDETERMINED explicitly cannot distinguish filtering from
+server/network failure. A handover may have occurred since connection start.

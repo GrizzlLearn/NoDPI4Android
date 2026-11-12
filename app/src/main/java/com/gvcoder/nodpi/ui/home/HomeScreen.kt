@@ -116,6 +116,7 @@ fun HomeScreen(
             PowerButton(
                 status = status,
                 onClick = { if (ProxyController.isActive) ProxyController.stop(context) else onStart() },
+                enabled = ProxyController.isActive || !settings.vpnEnabled || !settings.vpnSelectedOnly || settings.toProxyConfig().capturedPackages.isNotEmpty(),
                 modifier = Modifier.padding(top = 16.dp),
             )
 
@@ -136,11 +137,21 @@ fun HomeScreen(
             }
 
             val runningConfig = (status as? ProxyStatus.Running)?.config ?: settings.toProxyConfig()
-            AddressCard(runningConfig.address(), runningConfig.host, runningConfig.port)
+            if (runningConfig.vpnEnabled) {
+                Text(stringResource(R.string.vpn_enabled), style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.vpn_description))
+                if (runningConfig.vpnSelectedOnly && runningConfig.capturedPackages.isEmpty()) {
+                    Text(stringResource(R.string.vpn_select_required), color = MaterialTheme.colorScheme.error)
+                }
+            } else {
+                AddressCard(runningConfig.address(), runningConfig.host, runningConfig.port)
+            }
+
+            RouteOverview(runningConfig, status is ProxyStatus.Running)
 
             StatisticsSection(stats)
 
-            HowToCard()
+            if (!runningConfig.vpnEnabled) HowToCard()
 
             Spacer(Modifier.height(8.dp))
         }
@@ -148,7 +159,7 @@ fun HomeScreen(
 }
 
 @Composable
-private fun PowerButton(status: ProxyStatus, onClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun PowerButton(status: ProxyStatus, onClick: () -> Unit, modifier: Modifier = Modifier, enabled: Boolean = true) {
     val active = status is ProxyStatus.Running || status is ProxyStatus.Starting
     val colors = MaterialTheme.colorScheme
 
@@ -195,6 +206,7 @@ private fun PowerButton(status: ProxyStatus, onClick: () -> Unit, modifier: Modi
 
     Surface(
         onClick = onClick,
+        enabled = enabled,
         shape = MorphShape(morph, progress, rotation),
         color = container,
         contentColor = content,

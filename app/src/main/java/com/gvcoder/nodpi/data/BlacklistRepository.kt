@@ -58,6 +58,22 @@ class BlacklistRepository(context: Context) {
         save(emptyList())
     }
 
+    /** Import replaces the list with one atomic file commit before publishing it. */
+    fun replaceAll(domains: List<String>) = synchronized(lock) {
+        val normalized = domains.mapNotNull(::normalizeDomain).distinct()
+        val atomic = android.util.AtomicFile(file)
+        val output = atomic.startWrite()
+        try {
+            output.write(normalized.joinToString("\n", postfix = if (normalized.isEmpty()) "" else "\n").toByteArray())
+            atomic.finishWrite(output)
+        } catch (error: Throwable) {
+            atomic.failWrite(output)
+            throw error
+        }
+        _domains.value = normalized
+        _revision.value++
+    }
+
     fun resetToDefault() = synchronized(lock) {
         save(DEFAULT_BLACKLIST)
     }

@@ -26,7 +26,6 @@ import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.RestartAlt
-import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.Wifi
@@ -63,8 +62,6 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.gvcoder.nodpi.AppGraph
 import com.gvcoder.nodpi.R
-import com.gvcoder.nodpi.core.BlacklistMode
-import com.gvcoder.nodpi.core.DomainMatching
 import com.gvcoder.nodpi.data.AppLanguage
 import com.gvcoder.nodpi.data.AppLocale
 import com.gvcoder.nodpi.data.AppSettings
@@ -89,8 +86,27 @@ fun SettingsScreen(settings: AppSettings, status: ProxyStatus, onOpenAbout: () -
     val scope = rememberCoroutineScope()
     val revision by AppGraph.blacklist.revision.collectAsStateWithLifecycle()
 
+    var settingsError by remember { mutableStateOf<String?>(null) }
+
     fun update(transform: (AppSettings) -> AppSettings) {
-        scope.launch { AppGraph.settings.update(transform) }
+        scope.launch {
+            runCatching { AppGraph.settings.update(transform) }
+                .onSuccess { settingsError = null }
+                .onFailure { settingsError = it.message ?: it.javaClass.simpleName }
+        }
+    }
+
+    fun applyNetwork(transform: (AppSettings) -> AppSettings) {
+        scope.launch {
+            runCatching { AppGraph.settings.update(transform) }
+                .onSuccess {
+                    settingsError = null
+                    val updated = AppGraph.settings.current()
+                    runCatching { updated.toProxyConfig().validateRoutes() }
+                        .onSuccess { if (ProxyController.isActive) ProxyController.restart(context) }
+                        .onFailure { settingsError = it.message ?: it.javaClass.simpleName }
+                }.onFailure { settingsError = it.message ?: it.javaClass.simpleName }
+        }
     }
 
     var batteryUnrestricted by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
@@ -114,6 +130,7 @@ fun SettingsScreen(settings: AppSettings, status: ProxyStatus, onOpenAbout: () -
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
+            settingsError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             AnimatedVisibility(hasPendingChanges(status, settings, revision)) {
                 InfoBanner(
                     icon = Icons.Rounded.RestartAlt,
@@ -121,65 +138,25 @@ fun SettingsScreen(settings: AppSettings, status: ProxyStatus, onOpenAbout: () -
                     containerColor = MaterialTheme.colorScheme.tertiaryContainer,
                     contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
                     action = {
-                        TextButton(onClick = { ProxyController.restart(context) }) {
-                            Text(stringResource(R.string.action_restart))
+                        TextButton(onClick = {
+                            runCatching { settings.toProxyConfig().validateRoutes() }
+                                .onSuccess { ProxyController.restart(context) }
+                                .onFailure { settingsError = it.message ?: it.javaClass.simpleName }
+                        }) {
+                            Text(stringResource(R.string.action_apply_reconnect))
                         }
                     },
                 )
             }
 
-            ProxySection(settings, ::update)
+            VpnSettings(settings, ::update, ::applyNetwork)
 
-            ItemGroup(
-                title = stringResource(R.string.settings_unblocking),
-                items = listOf<@Composable () -> Unit>(
-                    {
-                        ChoiceItem(
-                            title = stringResource(R.string.settings_mode),
-                            description = stringResource(
-                                when (settings.blacklistMode) {
-                                    BlacklistMode.STANDARD -> R.string.settings_mode_standard_desc
-                                    BlacklistMode.ALL -> R.string.settings_mode_all_desc
-                                    BlacklistMode.AUTO -> R.string.settings_mode_auto_desc
-                                },
-                            ),
-                            options = listOf(
-                                stringResource(R.string.settings_mode_standard),
-                                stringResource(R.string.settings_mode_all),
-                                stringResource(R.string.settings_mode_auto),
-                            ),
-                            selected = settings.blacklistMode.ordinal,
-                            onSelect = { index -> update { it.copy(blacklistMode = BlacklistMode.entries[index]) } },
-                        )
-                    },
-                    {
-                        ChoiceItem(
-                            title = stringResource(R.string.settings_matching),
-                            description = stringResource(
-                                if (settings.domainMatching == DomainMatching.STRICT) R.string.settings_matching_strict_desc
-                                else R.string.settings_matching_loose_desc,
-                            ),
-                            options = listOf(
-                                stringResource(R.string.settings_matching_strict),
-                                stringResource(R.string.settings_matching_loose),
-                            ),
-                            selected = settings.domainMatching.ordinal,
-                            onSelect = { index -> update { it.copy(domainMatching = DomainMatching.entries[index]) } },
-                        )
-                    },
-                    {
-                        SwitchItem(
-                            icon = Icons.Rounded.Shuffle,
-                            title = stringResource(R.string.settings_disorder),
-                            description = stringResource(R.string.settings_disorder_desc),
-                            checked = settings.disorder,
-                            onCheckedChange = { value -> update { it.copy(disorder = value) } },
-                        )
-                    },
-                ),
-            )
+            SettingsTransferSection(settings)
 
-            AuthSection(settings, ::update)
+            if (!settings.vpnEnabled) {
+                ProxySection(settings, ::update)
+                AuthSection(settings, ::update)
+            }
 
             ItemGroup(
                 title = stringResource(R.string.settings_appearance),
@@ -400,7 +377,7 @@ private fun AuthSection(settings: AppSettings, update: ((AppSettings) -> AppSett
 }
 
 @Composable
-private fun SwitchItem(
+internal fun SwitchItem(
     icon: ImageVector,
     title: String,
     description: String,
@@ -430,7 +407,7 @@ private fun NavigationItem(icon: ImageVector, title: String, description: String
 }
 
 @Composable
-private fun ChoiceItem(
+internal fun ChoiceItem(
     title: String,
     description: String?,
     options: List<String>,

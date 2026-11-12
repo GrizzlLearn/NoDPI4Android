@@ -1,6 +1,7 @@
 package com.gvcoder.nodpi.service
 
-import android.app.Service
+import android.net.VpnService
+import android.net.ConnectivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -31,20 +32,31 @@ import kotlinx.coroutines.withContext
 import java.net.BindException
 
 /** Foreground service that owns the running [ProxyServer] */
-class ProxyService : Service() {
+class ProxyService : VpnService() {
 
     // All proxy start/stop operations run one at a time on this dispatcher
     private val control = Dispatchers.IO.limitedParallelism(1)
     private val scope = CoroutineScope(SupervisorJob() + control)
 
+    private val resourceLock = Any()
+    private var destroyed = false
     private var server: ProxyServer? = null
+    @Volatile private var vpn: LocalVpn? = null
     private var statsJob: Job? = null
+    private var networkMonitor: PhysicalNetworkMonitor? = null
+    private var networkTracker: NetworkChangeTracker? = null
+    private var reconnectJob: Job? = null
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(AppLocale.wrap(newBase))
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
+
+    override fun onRevoke() {
+        ProxyController.log.info("VPN", "LIFECYCLE", "VPN permission revoked or another VPN took over")
+        scope.launch { shutdown(null) }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -56,6 +68,11 @@ class ProxyService : Service() {
             ACTION_RESTART -> {
                 if (!promote()) return START_NOT_STICKY
                 scope.launch {
+                    try { AppGraph.settings.current().toProxyConfig().validateRoutes() }
+                    catch (error: Exception) {
+                        ProxyController.log.error("CONFIG", "APPLY", "Configuration rejected; running VPN retained: ${error.message}")
+                        return@launch
+                    }
                     stopProxy()
                     startProxy()
                 }
@@ -73,8 +90,11 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
-        server?.stop()
-        server = null
+        ProxyController.log.info("SERVICE", "LIFECYCLE", "Service destroyed by Android")
+        synchronized(resourceLock) {
+            destroyed = true
+            stopProxy()
+        }
         scope.cancel()
         if (ProxyController.status.value !is ProxyStatus.Failed) {
             ProxyController.setStatus(ProxyStatus.Stopped)
@@ -105,6 +125,7 @@ class ProxyService : Service() {
         ProxyController.setStatus(ProxyStatus.Starting)
 
         val config = AppGraph.settings.current().toProxyConfig()
+        ProxyController.log.info("CONFIG", "START", "vpn=${config.vpnEnabled}; selectedOnly=${config.vpnSelectedOnly}; apps=${config.vpnPackages.size}; mode=${config.blacklistMode}; doh=${config.dohEnabled}; ipv4Only=${config.ipv4Only}")
         val blacklistRepository = AppGraph.blacklist
         val revision = blacklistRepository.revision.value
         val blacklist: Blacklist = when (config.blacklistMode) {
@@ -114,14 +135,27 @@ class ProxyService : Service() {
                 known = blacklistRepository.domains.value,
                 matching = config.domainMatching,
                 onDetected = blacklistRepository::addDetected,
+                probe = { com.gvcoder.nodpi.core.TlsProbe.isHandshakeTimingOut(it, com.gvcoder.nodpi.core.DomainResolver(config.dohEnabled)) },
             )
         }
 
         val stats = ProxyStats()
-        val proxy = ProxyServer(config, blacklist, stats, ProxyController.log)
+        val proxy = ProxyServer(config, blacklist, stats, ProxyController.log) {
+            networkDiagnostics(getSystemService(ConnectivityManager::class.java))
+        }
         try {
-            proxy.start()
-        } catch (e: Exception) {
+            synchronized(resourceLock) {
+                if (destroyed) return
+                proxy.start()
+                server = proxy
+                if (config.vpnEnabled) {
+                    vpn = LocalVpn(this).also { it.start(config) }
+                }
+                ProxyController.setStats(StatsSnapshot())
+                ProxyController.setStatus(ProxyStatus.Running(config, revision))
+            }
+        } catch (e: Throwable) {
+            proxy.stop()
             val message = if (e is BindException) {
                 getString(R.string.error_address_in_use, config.address())
             } else {
@@ -131,16 +165,17 @@ class ProxyService : Service() {
             return
         }
 
-        server = proxy
-        ProxyController.setStats(StatsSnapshot())
-        ProxyController.setStatus(ProxyStatus.Running(config, revision))
-
+        if (config.vpnEnabled) monitorPhysicalNetworks(proxy)
         val address = config.address()
         ProxyNotifications.update(this, ProxyNotifications.build(this, address, null))
         statsJob = scope.launch(Dispatchers.Default) {
             var ticks = 0
             while (isActive) {
                 delay(1_000)
+                if (config.vpnEnabled && vpn?.isRunning() != true) {
+                    scope.launch { shutdown(ProxyStatus.Failed(getString(R.string.vpn_tunnel_stopped))) }
+                    break
+                }
                 val snapshot = stats.tick()
                 ProxyController.setStats(snapshot)
                 if (++ticks % NOTIFICATION_UPDATE_TICKS == 0) {
@@ -150,7 +185,60 @@ class ProxyService : Service() {
         }
     }
 
-    private fun stopProxy() {
+    private fun monitorPhysicalNetworks(appliedServer: ProxyServer) {
+        val tracker = NetworkChangeTracker()
+        lateinit var monitor: PhysicalNetworkMonitor
+        monitor = PhysicalNetworkMonitor(getSystemService(ConnectivityManager::class.java)) {
+            synchronized(resourceLock) {
+                if (destroyed || server !== appliedServer) return@PhysicalNetworkMonitor
+                reconnectJob?.cancel()
+                reconnectJob = scope.launch {
+                    repeat(3) { attempt ->
+                        delay(if (attempt == 0) 750 else 2000)
+                        try {
+                            synchronized(resourceLock) {
+                                if (destroyed || server !== appliedServer || networkMonitor !== monitor) return@launch
+                                val snapshot = monitor.snapshot()
+                                val reconnect = tracker.needsReconnect(snapshot.identity)
+                                vpn?.onUnderlyingNetworkChanged(snapshot.networks, reconnect)
+                                if (reconnect) {
+                                    appliedServer.resetConnections()
+                                    ProxyController.log.info("VPN", "NETWORK", if (snapshot.networks.isEmpty())
+                                        "NETWORK_UNAVAILABLE; VPN retained; applied routes unchanged" else
+                                        "NETWORK_CHANGED; connections reset; VPN and applied routes retained")
+                                }
+                                tracker.applied(snapshot.identity)
+                            }
+                            return@launch
+                        } catch (error: Exception) {
+                            if (error is kotlinx.coroutines.CancellationException) throw error
+                            ProxyController.log.error("VPN", "NETWORK", "NETWORK_UPDATE_FAILED; attempt=${attempt + 1}; VPN retained; ${error.javaClass.simpleName}")
+                        }
+                    }
+                }
+            }
+        }
+        synchronized(resourceLock) {
+            if (destroyed || server !== appliedServer) return
+            networkTracker = tracker
+            networkMonitor = monitor
+            try { monitor.start() } catch (error: Exception) {
+                monitor.close()
+                networkMonitor = null
+                ProxyController.log.error("VPN", "NETWORK", "NETWORK_MONITOR_FAILED: ${error.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun stopProxy() = synchronized(resourceLock) {
+        networkTracker?.stop()
+        networkTracker = null
+        networkMonitor?.close()
+        networkMonitor = null
+        reconnectJob?.cancel()
+        reconnectJob = null
+        vpn?.close()
+        vpn = null
         statsJob?.cancel()
         statsJob = null
         server?.stop()
@@ -158,6 +246,8 @@ class ProxyService : Service() {
     }
 
     private suspend fun shutdown(status: ProxyStatus.Failed?) {
+        if (status != null) ProxyController.log.error("SERVICE", "STOP", status.message)
+        else ProxyController.log.info("SERVICE", "STOP", "Stop requested or VPN revoked")
         stopProxy()
         ProxyController.setStatus(status ?: ProxyStatus.Stopped)
         withContext(Dispatchers.Main) {
