@@ -41,7 +41,15 @@
   - [System requirements](#system-requirements)
   - [Terms of Use and Disclaimer](#terms-of-use-and-disclaimer)
   - [Quick start](#quick-start)
+    - [Local VPN](#local-vpn-android-10)
+    - [Manual HTTP proxy](#manual-http-proxy)
     - [Additional Blacklists](#additional-blacklists)
+  - [VPN routes, DNS and diagnostics](#vpn-routes-dns-and-diagnostics)
+    - [External SOCKS5](#external-socks5)
+    - [DNS and IPv4-only mode](#dns-and-ipv4-only-mode)
+    - [Resource management and network changes](#resource-management-and-network-changes)
+    - [Journal and connection checks](#journal-and-connection-checks)
+    - [Settings transfer](#settings-transfer)
   - [Building APK from source code](#building-apk-from-source-code)
   - [FAQ](#faq)
   - [Star History](#star-history)
@@ -53,7 +61,10 @@
  
   This utility was developed primarily for Russian users as a simpler (but less powerful) replacement for similar tools. In most cases, it gets the job done; in particular, it allows you to use YouTube without any problems.
 
-  But unfortunately, the absolute performance of this utility cannot be guaranteed. Some sites, such as YouTube, are good to unlock, while others, as Instagram.com or Facebook.com, require completely different methods for bypassing locks, which are not yet implemented in this utility from their low-leveling and difficulty. Sometimes, the performance of certain sites can also depend on the provider - how it blocks the site and what technical means applies.
+  Access depends on the provider and the type of filtering. This fork adds a local VPN
+  with app selection, optional external SOCKS5 routes, DNS over HTTPS and IPv4-only mode.
+  Instagram and YouTube were tested on the user's network; availability on other networks
+  is not guaranteed. Local TLS fragmentation cannot overcome IP-based blocking.
 
 <div align="center">
   <p>
@@ -63,7 +74,7 @@
 
 ### How does this work
 
-NoDPI launches a proxy server on your device through which you direct http(s) traffic. The program intercepts ClientHello of outing connections and fragments them according to the following method:
+NoDPI can capture selected apps through a local VPN or accept traffic through a manually configured HTTP proxy. Locally routed HTTPS traffic passes through the proxy and TLS fragmenter. The program intercepts ClientHello of outing connections and fragments them according to the following method:
 
 The packet contains a field that holds the SNI record. The ClientHello message is split into several TLS records: the portion preceding the SNI, the portion containing the SNI (character by character), and the portion following the SNI. A header indicating the ClientHello type is added to each of these parts. Unless out-of-order packet handling (disordering) is disabled, the first of these parts is sent with a TTL=1, causing it to be dropped by the nearest network device. As a result, the DPI (Deep Packet Inspection) system fails to identify the domain for which the connection is being established and allows the connection to proceed. The operating system subsequently retransmits the first part with a standard TTL.
 
@@ -73,21 +84,20 @@ Also, the TLS version is replaced by version 1.3, which is the most modern (but 
 > Sites hosted on Cloudflare are sent without fragmentation. DPI treats connections to Cloudflare differently: a blocked domain is dropped even when fragmented, and a connection whose domain DPI could not read is frozen after the first ~16 KB. Fragmentation cannot unblock such sites and only breaks the allowed ones.
 
 > [!IMPORTANT]
-> NoDPI only works with HTTPS traffic. He can also take HTTP traffic, but purely for compatibility - sites working through this outdated protocol are practically not subject to unlock and the program simply sends traffic to the addressee.
+> Local DPI bypass processes HTTPS. Plain HTTP is forwarded for compatibility. The optional external SOCKS5 route supports TCP and does not rely on TLS fragmentation.
 
-NoDPI does not collect and does not send any data about you, does not use any third-party programs, does not interfere in the system processes and does not require root rights to work.
+No root access is required. Other apps’ HTTPS remains encrypted; NoDPI does not decrypt it. Connection metadata is stored in a private local journal. Optional DoH sends DNS queries to Cloudflare, and external SOCKS5 sends selected traffic through the server you configure.
 
 The app is written in Kotlin with Jetpack Compose (Material 3 Expressive). The proxy runs in a foreground service and can be toggled from a quick settings tile.
 
 ### Sites currently unavailable via NoDPI
 
-As of October 2026, the following services and websites cannot be unblocked using NoDPI:
-- Telegram
-- WhatsApp 
-- Voice and video in Discord
-- Blocked sites hosted on Cloudflare
-
-All sites blocked by IP address are also unavailable.
+Local TLS fragmentation is not a general-purpose tunnel. Telegram/MTProto,
+WhatsApp, Discord calls and IP-blocked destinations may require a reachable external
+route. An external SOCKS5 server can be configured for selected apps, but its IP must
+be reachable from the user's network. External UDP is currently blocked, so calls and
+other UDP-only features are not supported through that route. Existing Cloudflare
+fragmentation exclusions remain in effect.
 
 ### Alternatives
 
@@ -113,7 +123,7 @@ All sites blocked by IP address are also unavailable.
 
 ## System requirements
 
-The application requires Android 7.0 and above.
+Manual HTTP proxy mode requires Android 7.0 or newer. Local VPN and per-app routing require Android 10 or newer.
 The application also uses permission to send notifications. For the correct operation of the proxy service, it is recommended to disable energy consumption optimization in the application's system settings
 
 ## Terms of Use and Disclaimer
@@ -133,16 +143,114 @@ Your use of this software constitutes your agreement to the terms of this discla
 
 ## Quick start
 
-1) Download the latest version from [the Releases page](https://github.com/GVCoder09/NoDPI4Android/releases) and install it
-2) Start the proxy with the power button on the main screen
-3) In the Wi-Fi settings of Android set the proxy to manual, host 127.0.0.1, port 8881
-4) Enjoy!
+### Local VPN (Android 10+)
 
-Please report any problems and malfunctions to us on [the Issues page](https://github.com/GVCoder09/NoDPI4Android/issues)
+1. Install an APK built from this fork (see [Building APK](#building-apk-from-source-code)).
+2. Remove any manual NoDPI proxy from Android Wi-Fi settings once: set Proxy to None.
+3. In **Connection and bypass**, enable **Local VPN** and choose **All apps** or **Selected apps**.
+4. Start NoDPI and accept Android's VPN permission dialog.
+5. If the network has unusable IPv6, enable **IPv4 only**, apply/reconnect and restart affected apps.
+
+The local VPN applies bypass to all HTTPS domains of captured apps, with the existing
+Cloudflare exclusions. There is no second domain-mode switch. Stopping the VPN restores
+direct routing unless Android's block-connections-without-VPN policy is enabled. Only
+one VPN can be active in a profile; NoDPI itself is excluded to prevent routing loops.
+
+### Manual HTTP proxy
+
+Disable local VPN, start the proxy, and set the Wi-Fi proxy to `127.0.0.1:8881`
+(or your configured address/port). Apps must honor that proxy setting. Remove it when
+stopping NoDPI; Android does not let an ordinary app edit the saved Wi-Fi proxy automatically.
+Domain lists and Standard/All/Auto processing modes apply to this manual-proxy mode.
 
 ### Additional Blacklists
 
-By default, a blacklist containing YouTube-only domains is used. Additional lists can be found [here](https://github.com/GVCoder09/NoDPI/tree/main/blacklists).
+The default manual-proxy domain list covers YouTube only. Additional lists can be found [here](https://github.com/GVCoder09/NoDPI/tree/main/blacklists).
+
+## VPN routes, DNS and diagnostics
+
+### External SOCKS5
+
+Configure a server hostname/IP without a URL scheme, port and optional username/password,
+then select the apps that should use it. Those apps are automatically included in VPN
+capture; other captured apps use local bypass. The home screen shows the applied routes.
+Use **Save and apply** in app selection or **Apply and reconnect** for other network changes.
+
+Routing uses the original connection owner UID, not destination IP/domain heuristics.
+Shared-UID groups must be selected in full. With external routing enabled, unknown owners
+are rejected. An unavailable proxy or authentication failure never falls back directly.
+External SOCKS5 currently supports TCP only; external UDP is blocked. SOCKS5 itself does
+not encrypt the connection to the proxy. Passwords use Android Keystore encryption and
+are excluded from logs; restoring on another device requires entering them again.
+
+### DNS and IPv4-only mode
+
+VPN DNS forwards real wire responses through Cloudflare DoH (`https://1.1.1.1/dns-query`)
+or physical-network DNS servers. It no longer generates temporary `198.19.*` addresses.
+Old synthetic addresses and unsupported internal DNS probes are rejected immediately;
+restart affected apps after upgrading to clear old DNS caches. DoH errors do not silently
+fall back to system DNS. External-route apps use this same resolver, not DNS through SOCKS5.
+The manual-proxy DoH address resolver requests IPv4 addresses.
+
+**IPv4 only** defaults off. When enabled, VPN DNS returns NOERROR/NODATA for AAAA and
+HTTPS/SVCB queries, allowing ordinary A resolution. Cached IPv6 destinations are rejected;
+IPv6 routes remain captured so selected traffic cannot bypass the VPN. IPv6-only services
+will be unavailable. Apps with their own encrypted DNS may still obtain IPv6 answers,
+but captured IPv6 connections remain blocked. Apply/reconnect and restart apps after changing it.
+
+### Resource management and network changes
+
+| Resource | Limit |
+|---|---:|
+| Shared local/external traffic sessions | 128 |
+| Traffic UDP associations | 16 |
+| Separate DNS sessions | 16 |
+| HTTP proxy connections | 128 |
+| Native engine sessions | 256 |
+
+Worker pools are bounded. QUIC associations are closed to encourage HTTPS-over-TCP
+fallback; local UDP otherwise has no DPI bypass. Idle UDP associations expire after
+30 seconds. TCP tracks activity in both directions and expires after 60 seconds of
+inactivity; capacity pressure can reclaim a TCP flow idle for at least 5 seconds.
+A full DNS pool can reclaim an already answered idle UDP association after a reply-drain
+grace interval. State is rechecked under a lock; in-flight DNS queries are not selected.
+Repeated limit failures are aggregated with pool/session/phase/idle diagnostics.
+Actual memory, CPU and battery use still need device measurements.
+
+Physical-network changes preserve the TUN interface and applied routes, then reset old
+connections for app retry. Events debounce for 750 ms, with up to three update attempts.
+Offline state retains VPN capture. Handover does not load pending settings, and late
+callbacks cannot restart a stopped service.
+
+### Journal and connection checks
+
+The private no-backup journal retains 500 entries across process restarts. Java crash
+stacks are recorded separately where possible; Android 11+ supplies previous process-exit
+information. Exported text starts with a timestamped title for receiving apps to name it.
+
+`FRAGMENTED` means processing was applied, not confirmed access. `REMOTE_DATA_RECEIVED`
+and `NO_REMOTE_DATA` distinguish destination bytes; generated CONNECT responses are
+excluded. A completed TLS handshake is not inferred from encrypted pass-through traffic.
+
+Errors include stage, selected IP/port/family, DNS source, measured DNS/TCP/phase time,
+nested cause and errno. A physical-network snapshot records transport, Android validation
+and default IPv4/IPv6 routes at failure time, without SSID/subscriber identifiers.
+`TIMEOUT_UNDETERMINED` does not claim filtering: a timeout alone cannot distinguish it
+from server/network failure, and the network may have changed since connection start.
+
+Explicit diagnostics check proxy DNS → TCP → CONNECT → certificate-verified TLS → HTTP.
+Start NoDPI first for local diagnostics. The SOCKS5 server check connects to
+`telegram.org:443`; domain diagnostics use the domain entered by the user.
+
+### Settings transfer
+
+Export/import uses the Android document picker and a versioned `.properties` file. It
+includes app routes, SOCKS endpoint, DNS/IPv4 and bypass options, and domains. All usernames
+and passwords, manual-proxy binding/authentication, autostart and consent are excluded.
+Import is validated and confirmed, replaces domains, and does not reconnect the running VPN.
+Authenticated SOCKS5 requires credentials again; incomplete authentication is rejected
+before replacing a working VPN. Old files without the IPv4 setting default to dual-stack mode.
+Limits: 1 MiB, 500 packages per list and 10,000 domains.
 
 ## Building APK from source code
 
@@ -152,13 +260,35 @@ By default, a blacklist containing YouTube-only domains is used. Additional list
 ./gradlew assembleDebug
 ```
 On Windows use `gradlew.bat assembleDebug`. The APK will be in `app/build/outputs/apk/debug/`.
+Debug builds are named **NoDPI Test**, use application ID `com.gvcoder.nodpi.test` and can
+be installed alongside the main app. Updates require the same signing key.
 
 3) Install it on a device connected via adb:
 ```bash
 ./gradlew installDebug
 ```
 
-Unit tests of the fragmentation and blacklist logic: `./gradlew testDebugUnitTest`.
+Validation:
+
+```bash
+./gradlew testDebugUnitTest assembleDebug assembleRelease lintDebug --no-daemon
+python3 scripts/test-native-routing.py
+```
+
+The pinned HevSocks5Tunnel 2.19.3 source, routing patch, licenses and native build are
+documented in [native/README.md](native/README.md). Rebuilding requires NDK 28.2.13676358;
+the bundled AAR supports four ABIs with 16 KiB ELF alignment. JNI routing runs on a dedicated
+worker and retains its callback under R8. A prebuilt patched AAR is included for app builds.
+
+The [validation workflow](.github/workflows/validation.yml) runs on push/PR: native rebuild,
+native harness, JVM tests, debug APK and lint. Lint errors fail validation. APK/reports are
+retained for seven days; there is no publishing step. CI's generated debug signing key is
+not guaranteed to match a locally installed test APK.
+
+The native harness tests request isolation with a deterministic callback. Real Android UID
+ownership, external SOCKS5 with a reachable server, network handovers and sustained background
+behavior still require device testing. Native shutdown latency in `onDestroy()` is a remaining
+ANR-risk area. Local socket/JVM tests do not replace those checks.
 
 ## FAQ
 
@@ -168,93 +298,12 @@ A: Yes, its usage is completely legal as of October 2025. However, you can be he
 
 *Q: Is it safe?*
 
-A: Yes, using this utility is safe. All traffic sent over HTTPS remains encrypted as it was before. Furthermore, we do not collect any user information.
+A: NoDPI forwards other apps’ HTTPS without decrypting it. Connection metadata is kept in the private local journal. Optional DoH and external SOCKS5 involve the configured DNS/proxy provider; see [DNS and diagnostics](#dns-and-ipv4-only-mode).
 
 *Q: Does this program mask my traffic? Can my ISP not see which sites I visit?*
 
-A: No. Unlike a VPN or Tor, this program does not hide your traffic from your Internet Service Provider (ISP). Your ISP can still see the IP addresses of the websites you connect to.
+A: Local bypass does not hide destination IP addresses from your ISP. External SOCKS5 changes the destination visible to your local network to the proxy server, but SOCKS5 itself does not encrypt that connection. DNS uses the selected local/system or DoH resolver; this is not an anonymity guarantee.
 
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=GVCoder09/NoDPI4Android&type=Date)](https://star-history.dera.page/#GVCoder09/NoDPI4Android&Date)
-
-## Local VPN (this fork)
-
-Android10+ supports local VPN; Android7–9 retains manual HTTP proxy mode. In
-Connection and bypass, choose all apps or selected apps. Their HTTPS uses local
-bypass for all domains (existing Cloudflare exclusions remain). Save and apply in
-the app picker reconnects a running VPN; other changes use Apply and reconnect.
-Remove the manual Wi-Fi proxy once. This occupies the profile's single VPN slot.
-Do not enable block-connections-without-VPN if direct access is needed after stopping.
-
-### External SOCKS5
-
-Configure a hostname/IP, port and optional username/password, then choose external-route
-apps. They are automatically included in VPN capture. Other captured apps retain local
-bypass. Shared-UID groups must be selected in full; otherwise external routing refuses startup.
-Passwords use Android Keystore encryption, never logs; restore on a new device requires
-re-entering them. SOCKS5 itself does not encrypt transport to the proxy.
-
-Routing uses original flow ownership, not destination heuristics. The patched
-HevSocks5Tunnel2.19.3 and reproducible build are documented in `native/README.md`.
-Unknown owners fail closed when external routing is enabled. External failures never
-fall back directly. External SOCKS5 currently supports TCP; external UDP is blocked.
-An actually reachable external server is required; IP-blocked proxies cannot work.
-
-### DNS, diagnostics and resource limits
-
-VPN DNS returns real addresses via Cloudflare wire DoH or underlying non-VPN network DNS.
-It no longer emits temporary198.19/16 addresses. DNS for external apps uses the same
-chosen resolver, not remote SOCKS DNS. Old synthetic addresses and internal DNS:853
-fail immediately; restart affected apps once after upgrading to refresh caches.
-The manual-proxy DoH address resolver retains its IPv4-only behavior.
-
-Home displays configured/applied app routes, without claiming reachability. Explicit
-diagnostics check proxy DNS, proxy TCP, CONNECT, certificate-verified TLS and an HTTP
-response. Local diagnostics require NoDPI running. SOCKS server testing connects to
-telegram.org:443. FRAGMENTED logs mean processing applied; remote-data receipt is a
-separate status and excludes generated CONNECT response bytes.
-
-Traffic bridges share128 session slots, at most16 occupied by UDP. DNS has16 separate slots. QUIC associations close immediately; UDP associations with no outbound packets close after30seconds. HTTP proxy has128 client slots. Worker pools are
-bounded. Local UDP has no DPI bypass; UDP/443 is dropped for TCP fallback. Apps without
-fallback may fail. The private no-backup journal retains500 entries. Android11+ previous
-process-exit information and a separate Java crash record aid diagnostics. Device tests
-are required to validate real Android UID ownership and sustained background behavior.
-
-### Network changes, settings transfer and CI
-
-Physical-network changes retain the VPN interface and applied app routes, then reset
-old sessions for application retry. Changes debounce750ms with up to3 update attempts.
-Offline state keeps VPN capture; pending settings are not loaded on handover and late
-callbacks cannot restart a stopped service.
-
-Settings transfer uses the Android document picker and a versioned `.properties` file.
-It includes app routes, SOCKS endpoint, bypass options and domains, excluding all usernames,
-passwords, manual-proxy binding/authentication, autostart and consent. Import is validated,
-confirmed, replaces domains, and does not reconnect a running VPN. Authenticated SOCKS
-requires credentials again before startup; invalid routes do not replace a running VPN.
-Limits are1MiB,500packages per list and10000domains.
-
-The push/PR validation workflow rebuilds the pinned native source, runs the native harness,
-unit tests, debug build and lint with errors enforced. APK/reports are retained7days;
-there is no deployment or publishing step.
-
-TCP bridge flows expire after60seconds with no traffic in either direction; capacity pressure first reclaims a TCP flow idle for at least5seconds. DNS UDP associations expire shortly after becoming idle following a reply. LIMIT diagnostics include pool identity, session counts, phases and idle age.
-
-### IPv4-only VPN mode
-
-The optional IPv4 only switch suppresses AAAA and HTTPS/SVCB DNS answers with
-NOERROR/NODATA and immediately rejects cached IPv6 destinations. IPv6 routes remain
-captured to prevent bypass. Apply/reconnect and restart affected apps to clear caches.
-IPv6-only services cannot work; apps using their own encrypted DNS can still obtain
-IPv6 answers, but captured IPv6 destinations remain blocked. The setting defaults off,
-is included in settings transfer, and old exports without it import as ordinary dual-stack
-mode. Manual HTTP proxy mode is unaffected.
-
-DNS pool pressure can reclaim a completed UDP association before periodic cleanup, after a short reply-drain grace interval. State is rechecked while synchronized with query-start; in-flight DNS queries are never selected. The DNS limit remains16.
-
-Connection failures include selected IP/port/family, DNS source, measured DNS/TCP and phase
-timing, nested causes and known errno. The physical-network snapshot is taken on failure
-and includes transport, Android validation and default IPv4/IPv6 routes; it is not a probe
-of that destination. TIMEOUT_UNDETERMINED explicitly cannot distinguish filtering from
-server/network failure. A handover may have occurred since connection start.
